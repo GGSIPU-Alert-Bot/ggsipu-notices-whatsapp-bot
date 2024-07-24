@@ -19,7 +19,8 @@ class WAHAService {
   private apiUrl: string;
   private sessionName: string;
   private maxQrCodeAttempts: number = 5;
-  private qrCodeExpirationTime: number = 30000; // 30 seconds in milliseconds
+  private qrCodeExpirationTime: number = 30000; 
+  private maxStartingWaitTime: number = 60000;
 
   constructor() {
     this.apiUrl = config.wahaApiUrl;
@@ -30,16 +31,19 @@ class WAHAService {
     const sessionStatus = await this.checkSessionStatus();
     if (sessionStatus.status === 'SCAN_QR_CODE') {
       await this.handleQrCodeScan();
+    } else if (sessionStatus.status === 'STARTING') {
+      await this.waitForQrCode();
     } else if (sessionStatus.status !== 'WORKING') {
       throw new Error(`Unexpected session status: ${sessionStatus.status}`);
     } else {
       logger.info(`Session authenticated for user: ${sessionStatus.me?.pushName}`);
     }
-  }
+  }  
 
   private async checkSessionStatus(): Promise<SessionStatus> {
     try {
       const response = await axios.get<SessionStatus>(`${this.apiUrl}/api/sessions/${this.sessionName}`);
+      logger.debug(`Current session status: ${response.data.status}`);
       return response.data;
     } catch (error) {
       if (axios.isAxiosError(error) && error.response?.status === 404) {
@@ -54,6 +58,25 @@ class WAHAService {
       logger.error('Failed to check session status:', error);
       throw error;
     }
+  }
+
+  private async waitForQrCode(): Promise<void> {
+    logger.info('Waiting for QR code to become available...');
+    const startTime = Date.now();
+    while (Date.now() - startTime < this.maxStartingWaitTime) {
+      const sessionStatus = await this.checkSessionStatus();
+      if (sessionStatus.status === 'SCAN_QR_CODE') {
+        await this.handleQrCodeScan();
+        return;
+      } else if (sessionStatus.status === 'WORKING') {
+        logger.info('Session is now working.');
+        return;
+      } else if (sessionStatus.status !== 'STARTING') {
+        throw new Error(`Unexpected session status while waiting for QR code: ${sessionStatus.status}`);
+      }
+      await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5 seconds before checking again
+    }
+    throw new Error('Timed out waiting for QR code to become available');
   }
 
   private async handleQrCodeScan(): Promise<void> {
