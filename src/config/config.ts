@@ -7,5 +7,6 @@ export const config = {
   wahaApiUrl: process.env.WAHA_API_URL || 'http://localhost:3000',
   wahaSessionName: process.env.WAHA_SESSION_NAME || 'default',
   whatsappGroupIds: process.env.WHATSAPP_GROUP_IDS!.split(','),
-  port: parseInt(process.env.PORT || '9000', 10)
+  port: parseInt(process.env.PORT || '3000', 10),
+  publicIp: process.env.PUBLIC_IP || 'localhost',
 };

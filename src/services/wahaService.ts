@@ -19,7 +19,7 @@ class WAHAService {
   private apiUrl: string;
   private sessionName: string;
   private maxQrCodeAttempts: number = 5;
-  private qrCodeExpirationTime: number = 30000; 
+  private qrCodeExpirationTime: number = 60000; 
   private maxStartingWaitTime: number = 60000;
 
   constructor() {
