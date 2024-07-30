@@ -5,6 +5,10 @@ import { config } from './config/config';
 
 const app = express();
 
+app.get('/', (req, res) => {
+  res.send('Hello, World!');
+},);
+
 app.use('/webhook', webhookRoutes);
 
 async function startServer() {
