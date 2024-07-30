@@ -162,13 +162,18 @@ class WAHAService {
   async sendMessage(chatId: string, text: string): Promise<void> {
     try {
       await this.ensureAuthenticated();
-      await axios.post(`${this.apiUrl}/api/sendText`, {
+      const response = await axios.post(`${this.apiUrl}/api/sendText`, {
         chatId,
         text,
         session: this.sessionName
       });
+      logger.info(`Message sent successfully to ${chatId}. Response: ${JSON.stringify(response.data)}`);
     } catch (error) {
-      logger.error('Failed to send message:', error);
+      if (axios.isAxiosError(error)) {
+        logger.error(`Failed to send message to ${chatId}. Status: ${error.response?.status}, Data: ${JSON.stringify(error.response?.data)}`);
+      } else {
+        logger.error(`Failed to send message to ${chatId}. Error: ${error}`);
+      }
       throw error;
     }
   }
