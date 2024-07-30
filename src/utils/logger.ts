@@ -1,4 +1,3 @@
-
 import winston from 'winston';
 
 // Define log levels
@@ -22,12 +21,24 @@ const colors = {
 // Tell winston that you want to link the colors 
 winston.addColors(colors);
 
+// Custom format for error serialization
+const errorFormat = winston.format((info) => {
+  if (info instanceof Error) {
+    return Object.assign({}, info, {
+      stack: info.stack,
+      message: info.message
+    });
+  }
+  return info;
+});
+
 // Define the format of the log
 const format = winston.format.combine(
+  errorFormat(),
   winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss:ms' }),
   winston.format.colorize({ all: true }),
   winston.format.printf(
-    (info) => `${info.timestamp} ${info.level}: ${info.message}`,
+    (info) => `${info.timestamp} ${info.level}: ${info.message}${info.stack ? '\n' + info.stack : ''}`,
   ),
 );
 
