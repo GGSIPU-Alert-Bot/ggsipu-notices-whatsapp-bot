@@ -2,6 +2,7 @@ import axios from 'axios';
 import { config } from '../config/config';
 import { Notice } from '../models/Notice';
 import logger from '../utils/logger';
+import { backOff } from "exponential-backoff";
 
 interface SessionStatus {
   name: string;
@@ -159,71 +160,151 @@ class WAHAService {
     }
   }
 
-  async sendMessage(chatId: string, text: string): Promise<void> {
+  async downloadPdfWithRetry(url: string): Promise<Buffer> {
+    return backOff(async () => {
+      logger.info(`Attempting to download PDF from ${url}`);
+      const response = await axios({
+        method: 'get',
+        url: url,
+        responseType: 'arraybuffer',
+        onDownloadProgress: (progressEvent) => {
+          const percentCompleted = Math.round((progressEvent.loaded * 100) / (progressEvent.total || progressEvent.loaded));
+          logger.info(`Download progress: ${percentCompleted}%`);
+        }
+      });
+      const pdfBuffer = Buffer.from(response.data, 'binary');
+      logger.info(`Downloaded PDF. Size: ${pdfBuffer.length} bytes`);
+      if (pdfBuffer.length > 50 * 1024 * 1024) { // If larger than 50MB
+        throw new Error('PDF too large to send directly');
+      }
+      return pdfBuffer;
+    }, {
+      numOfAttempts: 5,
+      startingDelay: 1000,
+      timeMultiple: 2,
+      maxDelay: 30000,
+      jitter: 'full'
+    });
+  }
+
+  async sendFileMessage(chatId: string, fileBuffer: Buffer, filename: string, caption: string): Promise<void> {
     try {
       await this.ensureAuthenticated();
-      const response = await axios.post(`${this.apiUrl}/api/sendText`, {
+      
+      const response = await backOff(() => axios.post(`${this.apiUrl}/api/sendFile`, {
         chatId,
-        text,
+        file: {
+          mimetype: 'application/pdf',
+          filename: filename,
+          data: fileBuffer.toString('base64')
+        },
+        caption,
         session: this.sessionName
+      }), {
+        numOfAttempts: 5,
+        startingDelay: 1000,
+        timeMultiple: 2,
+        maxDelay: 60000,
+        jitter: 'full'
       });
-      logger.info(`Message sent successfully to ${chatId}. Response: ${JSON.stringify(response.data)}`);
+
+      logger.info(`File message sent successfully to ${chatId}. Response: ${JSON.stringify(response.data)}`);
     } catch (error) {
       if (axios.isAxiosError(error)) {
-        logger.error(`Failed to send message to ${chatId}. Status: ${error.response?.status}, Data: ${JSON.stringify(error.response?.data)}`);
+        logger.error(`Failed to send file message to ${chatId}. Status: ${error.response?.status}, Data: ${JSON.stringify(error.response?.data)}`);
       } else {
-        logger.error(`Failed to send message to ${chatId}. Error: ${error}`);
+        logger.error(`Failed to send file message to ${chatId}. Error: ${error}`);
+      }
+      throw error;
+    }
+  }
+
+  async sendLinkPreview(chatId: string, url: string, title: string): Promise<void> {
+    try {
+      await this.ensureAuthenticated();
+      const response = await backOff(() => axios.post(`${this.apiUrl}/api/sendLinkPreview`, {
+        chatId,
+        url,
+        title,
+        session: this.sessionName
+      }), {
+        numOfAttempts: 5,
+        startingDelay: 1000,
+        timeMultiple: 2,
+        maxDelay: 60000,
+        jitter: 'full'
+      });
+      logger.info(`Link preview sent successfully to ${chatId}. Response: ${JSON.stringify(response.data)}`);
+    } catch (error) {
+      if (axios.isAxiosError(error)) {
+        logger.error(`Failed to send link preview to ${chatId}. Status: ${error.response?.status}, Data: ${JSON.stringify(error.response?.data)}`);
+      } else {
+        logger.error(`Failed to send link preview to ${chatId}. Error: ${error}`);
       }
       throw error;
     }
   }
 
   async broadcastNotice(notice: Notice) {
-
-    const formattedUrl = notice.url.replace('http://www.', '');
-
-    const message = `
-  📢 *New Notice* 📢
-  
-  📝 *Title:* ${notice.title}
-
-  📅 *Date:* ${notice.date}
-
-  📄 *Download Link:* ${formattedUrl}
-  
-  Please download the PDF for more details.
-    `.trim();
+    const caption = this.formatNoticeCaption(notice);
   
     for (const groupId of config.whatsappGroupIds) {
       try {
-        await this.sendMessage(groupId, message);
+        logger.info(`Downloading PDF for notice ${notice.id}. URL: ${notice.url}`);
+        const pdfBuffer = await this.downloadPdfWithRetry(notice.url);
+        logger.info(`Downloaded PDF for notice ${notice.id}. Size: ${pdfBuffer.length} bytes`);
+
+        if (pdfBuffer.length > 50 * 1024 * 1024) {
+          await this.splitAndSendLargePdf(notice, pdfBuffer, groupId);
+        } else {
+          const filename = `Notice_${notice.id}.pdf`;
+          await this.sendFileMessage(groupId, pdfBuffer, filename, caption);
+        }
+
         logger.info(`Notice sent to group: ${groupId}`);
       } catch (error) {
-        logger.error(`Error sending message to group ${groupId}:`, error);
+        logger.error(`Error sending notice to group ${groupId}:`, error);
+        // Fallback to sending as link preview
+        try {
+          const title = `${caption}\n\nClick to view the notice`;
+          await this.sendLinkPreview(groupId, notice.url, title);
+          logger.info(`Notice sent as link preview to group: ${groupId}`);
+        } catch (fallbackError) {
+          logger.error(`Failed to send even as link preview to group ${groupId}:`, fallbackError);
+        }
       }
     }
   }
-  
+
+  private formatNoticeCaption(notice: Notice): string {
+    return `
+📢 *New Notice*
+
+📅 *Date:* ${new Date(notice.date).toLocaleDateString('en-US', { 
+  weekday: 'long', 
+  year: 'numeric', 
+  month: 'long', 
+  day: 'numeric' 
+})}
+
+📄 *Title:* ${notice.title}
+    `.trim();
+  }
+
+  private async splitAndSendLargePdf(notice: Notice, pdfBuffer: Buffer, chatId: string): Promise<void> {
+    const maxSize = 50 * 1024 * 1024; // 50 MB
+    const parts = Math.ceil(pdfBuffer.length / maxSize);
+    for (let i = 0; i < parts; i++) {
+      const start = i * maxSize;
+      const end = Math.min((i + 1) * maxSize, pdfBuffer.length);
+      const partBuffer = pdfBuffer.slice(start, end);
+      const partNotice = {...notice, title: `${notice.title} (Part ${i + 1} of ${parts})`};
+      const caption = this.formatNoticeCaption(partNotice);
+      const filename = `Notice_${notice.id}_Part_${i + 1}_of_${parts}.pdf`;
+      await this.sendFileMessage(chatId, partBuffer, filename, caption);
+      await new Promise(resolve => setTimeout(resolve, 2000)); // Wait between parts
+    }
+  }
 }
 
 export const wahaService = new WAHAService();
-
-// // Example usage
-// async function main() {
-//   try {
-//     await wahaService.startSession();
-    
-//     const notice: Notice = {
-//       id: 1,
-//       title: "Important Announcement",
-//       date: "2024-07-25",
-//       url: "http://example.com/notice.pdf"
-//     };
-
-//     await wahaService.broadcastNotice(notice);
-//   } catch (error) {
-//     logger.error('Error in main function:', error);
-//   }
-// }
-
-// main();
